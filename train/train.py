@@ -22,6 +22,13 @@ import transformers
 import utils
 from torch.utils.data import Dataset
 from transformers import Trainer
+from trl import DataCollatorForCompletionOnlyLM, SFTTrainer
+from peft import get_peft_model, get_peft_model_state_dict, set_peft_model_state_dict, prepare_model_for_kbit_training
+from peft import LoraConfig
+from transformers import HfArgumentParser, TrainingArguments, BitsAndBytesConfig
+from accelerate import Accelerator
+from template import *
+from datasets import load_dataset
 
 IGNORE_INDEX = -100
 DEFAULT_PAD_TOKEN = "[PAD]"
@@ -131,7 +138,6 @@ class SupervisedDataset(Dataset):
         super(SupervisedDataset, self).__init__()
         logging.warning("Loading data...")
         list_data_dict = utils.jload(data_path)
-        
 
         logging.warning("Formatting inputs...")
         prompt_input, prompt_no_input = PROMPT_DICT["prompt_input"], PROMPT_DICT["prompt_no_input"]
@@ -184,10 +190,41 @@ def train():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+    peft_config = LoraConfig(
+        r=32,
+        lora_alpha=64,
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+
+    quantization_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float32,
+    )
+    # Copy the model to each device
+    device_map = {"": Accelerator().local_process_index}
+    # torch_dtype = torch.float32
+
     model = transformers.AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
+        quantization_config=quantization_config,
+        device_map=device_map, 
     )
+
+    model = prepare_model_for_kbit_training(
+        model, use_gradient_checkpointing=True
+    )
+
+    model = get_peft_model(model, peft_config)
+    model.print_trainable_parameters()
+
+    model.config.use_cache = False  # silence the warnings. Please re-enable for inference!
+    # model.enable_input_require_grads()
+    # model.train()
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
@@ -196,6 +233,11 @@ def train():
         padding_side="right",
         use_fast=False,
     )
+    dataset = load_dataset("parquet", data_files = "/mnt/bn/data-tns-live-llm/leon/datasets/code.parquet", split = "train")
+    formatting_prompts_func, response_template = get_formatting_prompts_func("alpaca", tokenizer.eos_token) #只有'alpaca'和'vicuna' template， 返回一个函数，用于对输入进行预处理， response_template='\n### Response:' or ' ASSISTANT:'
+    response_template_ids = tokenizer.encode(response_template, add_special_tokens=False)[2:]   # Now we have it like in the dataset texts: `[2277, 29937, 4007, 22137, 29901]` for Llama2
+    data_collator = DataCollatorForCompletionOnlyLM(response_template_ids, tokenizer=tokenizer)
+    
     special_tokens_dict = dict()
     if tokenizer.pad_token is None:
         special_tokens_dict["pad_token"] = DEFAULT_PAD_TOKEN
@@ -212,8 +254,16 @@ def train():
         model=model,
     )
 
-    data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
-    trainer = Trainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
+    trainer = SFTTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        args = training_args,
+        train_dataset=dataset,
+        formatting_func=formatting_prompts_func,
+        data_collator=data_collator,
+    )
+    # data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
+    # trainer = Trainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
     trainer.train()
     trainer.save_state()
     trainer.save_model(output_dir=training_args.output_dir)
