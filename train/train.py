@@ -66,7 +66,7 @@ class TrainingArguments(transformers.TrainingArguments):
     model_max_length: int = field(
         default=1024,
         metadata={"help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."},
-    )
+    ),
 
 
 def smart_tokenizer_and_embedding_resize(
@@ -137,7 +137,9 @@ class SupervisedDataset(Dataset):
     def __init__(self, data_path: str, tokenizer: transformers.PreTrainedTokenizer):
         super(SupervisedDataset, self).__init__()
         logging.warning("Loading data...")
-        list_data_dict = utils.jload(data_path)
+        import polars as pl
+        if "parquet" in data_path: list_data_dict = pl.read_parquet(data_path).to_dicts()
+        else: list_data_dict = utils.jload(data_path)
 
         logging.warning("Formatting inputs...")
         prompt_input, prompt_no_input = PROMPT_DICT["prompt_input"], PROMPT_DICT["prompt_no_input"]
@@ -202,17 +204,18 @@ def train():
         load_in_4bit=True,
         bnb_4bit_use_double_quant=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float32,
+        bnb_4bit_compute_dtype=torch.float16,
     )
     # Copy the model to each device
-    device_map = {"": Accelerator().local_process_index}
+    # device_map = {"": Accelerator().local_process_index}
     # torch_dtype = torch.float32
 
     model = transformers.AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
         quantization_config=quantization_config,
-        device_map=device_map, 
+        device_map="auto", 
+        torch_dtype = torch.float16
     )
 
     model = prepare_model_for_kbit_training(
@@ -223,8 +226,7 @@ def train():
     model.print_trainable_parameters()
 
     model.config.use_cache = False  # silence the warnings. Please re-enable for inference!
-    # model.enable_input_require_grads()
-    # model.train()
+    model.enable_input_require_grads()
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
@@ -233,7 +235,8 @@ def train():
         padding_side="right",
         use_fast=False,
     )
-    dataset = load_dataset("parquet", data_files = "/mnt/bn/data-tns-live-llm/leon/datasets/code.parquet", split = "train")
+    if "parquet" in data_args.data_path: dataset = load_dataset("parquet", data_files = data_args.data_path, split = "train")
+    else: dataset = load_dataset("json", data_files = data_args.data_path, split = "train")
     formatting_prompts_func, response_template = get_formatting_prompts_func("alpaca", tokenizer.eos_token) #只有'alpaca'和'vicuna' template， 返回一个函数，用于对输入进行预处理， response_template='\n### Response:' or ' ASSISTANT:'
     response_template_ids = tokenizer.encode(response_template, add_special_tokens=False)[2:]   # Now we have it like in the dataset texts: `[2277, 29937, 4007, 22137, 29901]` for Llama2
     data_collator = DataCollatorForCompletionOnlyLM(response_template_ids, tokenizer=tokenizer)
@@ -257,14 +260,15 @@ def train():
     trainer = SFTTrainer(
         model=model,
         tokenizer=tokenizer,
-        args = training_args,
+        args=training_args,
         train_dataset=dataset,
         formatting_func=formatting_prompts_func,
         data_collator=data_collator,
     )
     # data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
     # trainer = Trainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
-    trainer.train()
+    with torch.autocast("cuda"): 
+        trainer.train()
     trainer.save_state()
     trainer.save_model(output_dir=training_args.output_dir)
 
