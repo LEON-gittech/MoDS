@@ -134,6 +134,8 @@ class SupervisedDataset(Dataset):
         if "parquet" in data_path: list_data_dict = pl.read_parquet(data_path).to_dicts()
         else: list_data_dict = utils.jload(data_path)
 
+        list_data_dict = list_data_dict[:10000]
+        
         logging.warning("Formatting inputs...")
         prompt_input, prompt_no_input = PROMPT_DICT["prompt_input"], PROMPT_DICT["prompt_no_input"]
         sources = [

@@ -2,7 +2,7 @@ import dataclasses
 import logging
 import math
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '5'
+# os.environ['CUDA_VISIBLE_DEVICES'] = '5'
 
 import io
 import sys
@@ -62,16 +62,16 @@ if ".parquet" in file_in: input_list = pl.read_parquet(file_in).to_dicts()
 else: input_list = jload(file_in)
 
 print('number of input file', len(input_list))
-
+device = torch.device("cuda:2")
 reward_name = "/mnt/bn/data-tns-live-llm/leon/datasets/reward-model-deberta-v3-large-v2/"
-rank_model, tokenizer = AutoModelForSequenceClassification.from_pretrained(reward_name, torch_dtype = torch.float16).cuda(), AutoTokenizer.from_pretrained(reward_name)
+rank_model, tokenizer = AutoModelForSequenceClassification.from_pretrained(reward_name, torch_dtype = torch.float16).to(device), AutoTokenizer.from_pretrained(reward_name)
 question, answer = "Explain nuclear fusion like I am five", "Nuclear fusion is the process by which two or more protons and neutrons combine to form a single nucleus. It is a very important process in the universe, as it is the source of energy for stars and galaxies. Nuclear fusion is also a key process in the production of energy for nuclear power plants."
-inputs = tokenizer(question, answer, return_tensors='pt').to("cuda")
+inputs = tokenizer(question, answer, return_tensors='pt').to(device)
 score = rank_model(**inputs).logits[0].detach()
 print(float(score))
 
 result_list = []
-for element in tqdm(input_list[:1000]):
+for element in tqdm(input_list[:10000]):
     instruction = element['instruction']
     _input = ''
     if 'input' in element.keys():
@@ -86,7 +86,7 @@ for element in tqdm(input_list[:1000]):
     answer = _output
     
     try:
-        inputs = tokenizer(question, answer, return_tensors='pt').to("cuda")
+        inputs = tokenizer(question, answer, return_tensors='pt').to(device)
         score = rank_model(**inputs).logits[0].detach()
     except:
         print(instruction)
